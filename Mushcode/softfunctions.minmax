@@ -54,11 +54,11 @@
 &FUN_NONZERO SoftFunctions=[ifelse(t(%0),%1,%2)]
 &MINMAX_NONZERO SoftFunctions=2 3
 &FUN_FN SoftFunctions=[bypass(1)][strfunc(%0,%1 %2 %3 %4 %5 %6 %7 %8 %9)][bypass(0)]
-&FUNPR_NAMEGRAB SoftFunctions=[setq(0,)][iter(%0,ifelse(strmatch(name(##),%1),##[setq(0,)][ibreak(0)],ifelse(and(!$r(0),strmatch(name(##),*%1*)),setq(0,##))),,)]%q0
+&FUNPR_NAMEGRAB SoftFunctions=[setq(0,)][iter(%0,ifelse(match([name(%i0)]|[num(%i0)]|[objid(%i0)],%1,|),%i0[setq(0,)][ibreak(0)],ifelse(and(!$r(0),strmatch(name(%i0),*%1*)),setq(0,%i0))),,)]%q0
 &FUNPR_SPEAK SoftFunctions=[setq(z,%2)][setq(y,%3)][setq(x,%1)][parsestr(%1,[ifelse(words(%qy),u(%#/%qy,%0,%1,ifelse(pos(mid(%qx,0,1),; :),add(%2,1),%2),%3,%4),%0)],",ifelse(words(%6%7),%6 %7,"),0,%0,,,,[ifelse(words(%qz),%qz,says%,)])]
 &MINMAX_SPEAK SoftFunctions=2 7
 &MINMAX_NAMEGRAB SoftFunctions=1 2
-&FUN_NAMEGRABALL SoftFunctions=[trim(squish(iter(%0,ifelse(strmatch(name(##),*%1*),##))))]
+&FUN_NAMEGRABALL SoftFunctions=[trim(squish(iter(%0,ifelse(cor(match([num(%i0)]|[objid(%i0)],%1,|),strmatch(name(%i0),*%1*)),%i0))))]
 &MINMAX_NAMEGRABALL SoftFunctions=1 2
 &FUNPR_NAMELIST SoftFunctions=[iter(%0,ifelse(!match(setr(0,pmatch(##)),#-1*),%q0,#-1[objeval(%#,u(%1,##,#-1))]))]
 &MINMAX_NAMELIST SoftFunctions=1 2
