@@ -2087,6 +2087,23 @@ NDECL(que_next)
 }
 
 /* ---------------------------------------------------------------------------
+ * update_player_time_stats: Called by do_second to update player time stats.
+ */
+static void update_player_time_stats(double timediff) {
+    DESC *d, *dnext;
+    double floored = floor(timediff);
+    DESC_SAFEITER_ALL(d, dnext) {
+         
+          if (d->flags & DS_CONNECTED) {
+             d->last_time = d->last_time + floored;
+             d->connected_at = d->connected_at + floored;
+          } else {
+             d->connected_at = d->connected_at + floored;
+          }
+       }
+}
+
+/* ---------------------------------------------------------------------------
  * do_second: Check the wait and semaphore queues for commands to remove.
  */
 
@@ -2097,7 +2114,7 @@ NDECL(do_second)
     DESC *d, *dnext;
     char *cmdsave, *cpulbuf;
     int i_offset, mtimerlen;
-    double d_timediff;
+    double d_timediff, d_timediff_floored;
 
     /* move contents of low priority queue onto end of normal one
      * this helps to keep objects from getting out of control since
@@ -2195,15 +2212,7 @@ NDECL(do_second)
           free_lbuf(cpulbuf);
        ENDLOG
        /* Ok, let's update the player time stats here */
-       DESC_SAFEITER_ALL(d, dnext) {
-         
-          if (d->flags & DS_CONNECTED) {
-             d->last_time = d->last_time + floor(d_timediff);
-             d->connected_at = d->connected_at + floor(d_timediff);
-          } else {
-             d->connected_at = d->connected_at + floor(d_timediff);
-          }
-       }
+       update_player_time_stats(d_timediff);
        /* Let's update the internal counters with the new time */
        mudstate.dump_counter = mudstate.dump_counter + d_timediff;
        mudstate.idle_counter = mudstate.idle_counter + d_timediff;

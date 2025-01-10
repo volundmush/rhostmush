@@ -2996,7 +2996,7 @@ main(int argc, char *argv[])
     }
     local_startup();
     /* --- main mush loop --- */
-    shovechars(mudconf.port, mudconf.ip_address);
+    run_game(mudconf.port, mudconf.ip_address);
     /* --- end main mush loop --- */
     local_shutdown();
     rebooting = mudstate.reboot_flag;
