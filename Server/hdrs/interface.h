@@ -9,6 +9,7 @@
 #include "externs.h"
 #include "htab.h"
 #include "alloc.h"
+#include "libtelnet.h"
 
 #include <sys/types.h>
 #include <sys/time.h>
@@ -165,60 +166,63 @@ struct descriptor_data_orig {
 
 typedef struct descriptor_data DESC;
 struct descriptor_data {
-  int descriptor;
-  int flags;
-  int retries_left;
-  int regtries_left;
-  int command_count;
-  int timeout;
-  int host_info;
-  char addr[51];
-  char doing[256];
-  dbref player;
-  char *output_prefix;
-  char *output_suffix;
-  int output_size;
-  int output_tot;
-  int output_lost;
-  TBLOCK *output_head;
-  TBLOCK *output_tail;
-  int input_size;
-  int input_tot;
-  int input_lost;
-  CBLK *input_head;
-  CBLK *input_tail;
-  CBLK *raw_input;
-  char *raw_input_at;
-  time_t connected_at;
-  time_t last_time;
-  int quota;
-  struct sockaddr_in address;	/* added 3/6/90 SCG */
-  struct descriptor_data *hashnext;
-  struct descriptor_data *next;
-  struct descriptor_data **prev;
-  struct SNOOPLISTNODE *snooplist;  /* added 2/95 Thorin */
-  int logged;
-  int authdescriptor;		    /* added 2/95 Thorin */
-  char userid[MBUF_SIZE];	    /* added 2/95 Thorin */
-  int door_desc;		/* added 11/15/97 Seawolf */
-  int door_num;			/* added 11/15/97 Seawolf */
-  TBLOCK *door_output_head;
-  TBLOCK *door_output_tail;
-  int door_output_size;
-  CBLK *door_input_head;
-  CBLK *door_input_tail;
-  int door_int1;
-  int door_int2;
-  int door_int3;
-  char *door_lbuf;
-  char *door_mbuf;
-  char *door_raw;
-  char checksum[WEBSOCKETS_CHECKSUM_LEN + 1];
-  long ws_frame_len;
-  dbref account_owner;		/* For softcoded account systems */
-  char account_rawpass[100];		/* For raw account password */
-  char longaddr[256]; /* Because DNS hostnames go huge these days */
-  int longaddrcheck; /* To ensure proper Descriptor upgrades */
+    int descriptor;
+    int flags;
+    int retries_left;
+    int regtries_left;
+    int command_count;
+    int timeout;
+    int host_info;
+    char addr[51];
+    char doing[256];
+    dbref player;
+    char *output_prefix;
+    char *output_suffix;
+    int output_size;
+    int output_tot;
+    int output_lost;
+    TBLOCK *output_head;
+    TBLOCK *output_tail;
+    int input_size;
+    int input_tot;
+    int input_lost;
+    CBLK *input_head;
+    CBLK *input_tail;
+    CBLK *raw_input;
+    char *raw_input_at;
+    time_t connected_at;
+    time_t last_time;
+    int quota;
+    struct sockaddr_in address; /* added 3/6/90 SCG */
+    struct descriptor_data *hashnext;
+    struct descriptor_data *next;
+    struct descriptor_data **prev;
+    struct SNOOPLISTNODE *snooplist; /* added 2/95 Thorin */
+    int logged;
+    int authdescriptor; /* added 2/95 Thorin */
+    char userid[MBUF_SIZE]; /* added 2/95 Thorin */
+    int door_desc; /* added 11/15/97 Seawolf */
+    int door_num; /* added 11/15/97 Seawolf */
+    TBLOCK *door_output_head;
+    TBLOCK *door_output_tail;
+    int door_output_size;
+    CBLK *door_input_head;
+    CBLK *door_input_tail;
+    int door_int1;
+    int door_int2;
+    int door_int3;
+    char *door_lbuf;
+    char *door_mbuf;
+    char *door_raw;
+    char checksum[WEBSOCKETS_CHECKSUM_LEN + 1];
+    long ws_frame_len;
+    dbref account_owner; /* For softcoded account systems */
+    char account_rawpass[100]; /* For raw account password */
+    char longaddr[256]; /* Because DNS hostnames go huge these days */
+    int longaddrcheck; /* To ensure proper Descriptor upgrades */
+    telnet_t *telnet;
+	int term_width;
+	int term_height;
 };
 
 /* flags in the flag field */
@@ -245,7 +249,7 @@ extern DESC *desc_in_use;
 
 extern void	emergency_shutdown(void);
 extern void	shutdownsock(DESC *, int);
-extern void	shovechars(int, char*);
+extern void	shovechars();
 extern void	set_signals(void);
 extern void	start_auth(DESC *);
 extern void 	check_auth_connect(DESC *);

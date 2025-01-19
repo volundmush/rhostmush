@@ -51,6 +51,7 @@ void bzero(void *, int);
 #include "rhost_utf8.h"
 #include "local.h"
 #include "door.h"
+#include "libtelnet.h"
 #ifdef ENABLE_WEBSOCKETS
 ///// NEW WEBSOCK
 #include "websock2.h"
@@ -88,6 +89,7 @@ static DESC *new_connection(int, int);
 static DESC *initializesock(int, struct sockaddr_in *, char *, int, int);
 int process_output(DESC *);
 static int process_input(DESC *);
+static void record_more_bytes(int got);
 
 int ndescriptors = 0;
 int signal_depth;
@@ -1112,6 +1114,248 @@ struct t_call *nc_call = (struct t_call *) NULL;
 
 #endif
 
+/* This function handles incoming bytes that are MUSH input. IE: User commands.*/
+static void
+process_app_data(DESC *d, const char *buf, size_t len)
+{
+    int got = len;
+    int in = got;
+    int lost = 0;
+    int in_get = 1;
+    char qfind[SBUF_SIZE], tmpbuf[SBUF_SIZE];
+    char *p, *pend, *q, *qend, *qf, *tmpptr = NULL;
+
+    memset(qfind, '\0', sizeof(qfind));
+    memset(tmpbuf, '\0', sizeof(tmpbuf));
+
+    if (!d->raw_input) {
+        d->raw_input = (CBLK *) alloc_lbuf("process_input.raw");
+        d->raw_input_at = d->raw_input->cmd;
+    }
+
+    p = d->raw_input_at;
+    pend = d->raw_input->cmd + LBUF_SIZE - sizeof(CBLKHDR) - 1;
+
+        // Iterates over received buf.
+    for (q = buf, qend = buf + got; q < qend; q++) {
+        /* newlines terminate MUSH commands. */
+        if ((*q == '\n') && (!(d->flags & DS_API) || (!in_get && ((q + 10) > qend) && (d->flags & DS_API)))) {
+            *p = '\0';
+            if (p > d->raw_input->cmd) {
+                save_command(d, d->raw_input);
+                /* We need a new buffer now. Let's allocate one and initialize our indexes. */
+                d->raw_input = (CBLK *) alloc_lbuf("process_input.raw");
+                p = d->raw_input_at = d->raw_input->cmd;
+                pend = d->raw_input->cmd + LBUF_SIZE - sizeof(CBLKHDR) - 1;
+            } else {
+                in -= 1; /* for newline */
+            }
+        /* handle the delete character for people using old-style terminal connections */
+        } else if ((*q == '\b') || (*q == 127)) {
+            /* Anything that sent in DEL probably needs to have it echoed back. */
+            queue_string(d, (*q == 127) ? "\b \b" : " \b");
+            in -= 2;
+            if (p > d->raw_input->cmd)
+                p--;
+            if (p < d->raw_input_at)
+                (d->raw_input_at)--;
+            /* Else let's print printables -- This is ASCII-7 [0-128] */
+        } else if (p < pend && ((*q == '\n') || (isascii((int) *q) && isprint((int) *q)))) {
+            *p++ = *q;
+        } else if (((p + 13) < pend) && *q && *(q + 1) && *(q + 2) && *(q + 3) && IS_4BYTE((int) (unsigned char) *q) &&
+                   IS_CBYTE(*(q + 1)) && IS_CBYTE(*(q + 2)) && IS_CBYTE(*(q + 3))) {
+            sprintf(tmpbuf, "%02x%02x%02x%02x", (int) (unsigned char) *q, (int) (unsigned char) *(q + 1),
+                    (int) (unsigned char) *(q + 2), (int) (unsigned char) *(q + 3));
+            tmpptr = encode_utf8(tmpbuf);
+            sprintf(qfind, "%s", tmpptr);
+            free_sbuf(tmpptr);
+
+            q += 3;
+            in += 12;
+            got += 12;
+            qf = qfind;
+            while (*qf) {
+                *p++ = *qf++;
+            }
+        } else if (((p + 13) < pend) && *q && *(q + 1) && *(q + 2) && IS_3BYTE((int) (unsigned char) *q) &&
+                   IS_CBYTE(*(q + 1)) && IS_CBYTE(*(q + 2))) {
+            sprintf(tmpbuf, "%02x%02x%02x", (int) (unsigned char) *q, (int) (unsigned char) *(q + 1),
+                    (int) (unsigned char) *(q + 2));
+            tmpptr = encode_utf8(tmpbuf);
+            sprintf(qfind, "%s", tmpptr);
+            free_sbuf(tmpptr);
+
+            q += 2;
+            in += 10;
+            got += 10;
+            qf = qfind;
+            while (*qf) {
+                *p++ = *qf++;
+            }
+        } else if (((p + 13) < pend) && *q && *(q + 1) && IS_2BYTE((int) (unsigned char) *q) && IS_CBYTE(*(q + 1))) {
+            sprintf(tmpbuf, "%02x%02x", (int) (unsigned char) *q, (int) (unsigned char) *(q + 1));
+            tmpptr = encode_utf8(tmpbuf);
+            sprintf(qfind, "%s", tmpptr);
+            free_sbuf(tmpptr);
+
+            q += 1;
+            in += 8;
+            got += 8;
+            qf = qfind;
+            while (*qf) {
+                *p++ = *qf++;
+            }
+            /* Let's handle accents [129-255] -- no accent_extend here as it's handled in eval.c in parse_ansi */
+        } else if ((((int) (unsigned char) *q) > 160) && (((int) (unsigned char) *q) < 256) && ((p + 10) < pend)) {
+            sprintf(qfind, "%c<%3d>", '%', (int) (unsigned char) *q);
+            in += 5;
+            got += 5;
+            qf = qfind;
+            while (*qf) {
+                *p++ = *qf++;
+            }
+        } else {
+            in--;
+            if (p >= pend)
+                lost++;
+        }
+    }
+
+    /* advance the raw_input buffer or clear it if we don't need it anymore. */
+    if (p > d->raw_input->cmd) {
+        d->raw_input_at = p;
+    } else {
+        free_lbuf(d->raw_input);
+        d->raw_input = NULL;
+        d->raw_input_at = NULL;
+    }
+
+    if (in > 0)
+        d->input_size += in;
+    if (lost > 0)
+        d->input_lost += lost;
+
+}
+
+static void
+process_app_command(DESC *d, char cmd) {
+
+}
+
+static void
+process_telnet_sub(DESC *d, unsigned char telopt, const char* buf, size_t len) {
+    switch (telopt) {
+        /* First we'll filter out anything handled by a TELNET_EV_* type. */
+        case TELNET_TELOPT_NAWS:
+        case TELNET_TELOPT_TTYPE:
+            return;
+    }
+}
+
+static void
+handle_telnet_enable_him(DESC *d, unsigned char telopt) {
+    switch (telopt) {
+        case TELNET_TELOPT_TTYPE:
+            /* when ttype is enabled we must open up with a SEND. */
+            telnet_ttype_send(d->telnet);
+            break;
+    }
+}
+
+static void
+handle_telnet_disable_him(DESC *d, unsigned char telopt) {
+
+}
+
+static void
+handle_telnet_send_mssp(DESC *d) {
+    /* This function should format and send MSSP data to desc using telnet_subnegotiate(). */
+}
+
+static void
+handle_telnet_enable_us(DESC *d, unsigned char telopt) {
+    switch (telopt) {
+        case TELNET_TELOPT_MSSP:
+            /* MSSP demands we send our status once it's been negotiated. */
+            handle_telnet_send_mssp(d);
+            break;
+    }
+}
+
+static void
+handle_telnet_disable_us(DESC *d, unsigned char telopt) {
+
+}
+
+static void
+telnet_handler(telnet_t *tel, telnet_event_t *ev, void *ud) {
+    DESC *d = ud;
+
+    switch (ev->type) {
+        case TELNET_EV_DATA:
+            process_app_data(d, ev->data.buffer, ev->data.size);
+            break;
+        case TELNET_EV_SEND:
+            queue_write(d, ev->data.buffer, ev->data.size);
+            break;
+        case TELNET_EV_IAC:
+            process_app_command(d, ev->iac.cmd);
+            break;
+        case TELNET_EV_NAWS:
+            d->term_width = ev->naws.width;
+            d->term_height = ev->naws.height;
+            break;
+        case TELNET_EV_SUBNEGOTIATION:
+            process_telnet_sub(d, ev->sub.telopt, ev->sub.buffer, ev->sub.size);
+            break;
+        case TELNET_EV_ENABLE_HIM:
+            handle_telnet_enable_him(d, ev->neg.telopt);
+            break;
+        case TELNET_EV_DISABLE_HIM:
+            handle_telnet_disable_him(d, ev->neg.telopt);
+            break;
+        case TELNET_EV_ENABLE_US:
+            handle_telnet_enable_us(d, ev->neg.telopt);
+            break;
+        case TELNET_EV_DISABLE_US:
+            handle_telnet_disable_us(d, ev->neg.telopt);
+            break;
+        case TELNET_EV_TTYPE:
+            handle_telnet_ttype(d, ev->ttype.cmd, ev->ttype.name);
+            break;
+        case TELNET_EV_WILL:
+        case TELNET_EV_WONT:
+        case TELNET_EV_DO:
+        case TELNET_EV_DONT:
+            /* These are all ignored because the ENABLE/DISABLE events are more specific.*/
+            break;
+
+    }
+}
+
+static const telnet_telopt_t my_telopts[] = {
+    {TELNET_TELOPT_NAWS, TELNET_WONT, TELNET_DO},
+    {TELNET_TELOPT_TTYPE, TELNET_WONT, TELNET_DO},
+    {TELNET_TELOPT_MSSP, TELNET_WILL, TELNET_DONT},
+    { -1, 0, 0 }
+};
+
+static void
+init_telnet(DESC *d) {
+    d->telnet = telnet_init(my_telopts, telnet_handler, 0, d);
+    /* Begin negotiations! */
+    int i;
+    for (i = 0; i < (sizeof(my_telopts) / sizeof(my_telopts[0]) - 1); i++) {
+        if (my_telopts[i].telopt == -1) break;
+        if (my_telopts[i].us == TELNET_WILL) {
+            telnet_negotiate(d->telnet, my_telopts[i].telopt, my_telopts[i].us);
+        }
+        if (my_telopts[i].him == TELNET_DO) {
+            telnet_negotiate(d->telnet, my_telopts[i].telopt, my_telopts[i].him);
+        }
+    }
+}
+
 static DESC *
 new_connection(int sock, int key)
 {
@@ -1545,8 +1789,15 @@ new_connection(int sock, int key)
     }
     mudstate.debug_cmd = cmdsave;
 
-    if ( key && d ) {
-       d->flags |= DS_API;
+    if (d) {
+        switch (key) {
+            case 0: // telnet
+                init_telnet(d);
+                break;
+            case 1:
+                d->flags |= DS_API;
+                break;
+        }
     }
     RETURN(d); /* #5 */
 }
@@ -1595,8 +1846,8 @@ static const char *disc_messages[] =
     "su"
 };
 
-void 
-shutdownsock(DESC * d, int reason)
+void
+shutdownsock(DESC *d, int reason)
 {
     char *buff, *buff2, all[10], tchbuff[LBUF_SIZE], tsitebuff[1001], *ptsitebuff;
     char *addroutbuf, *t_addroutbuf, *tstrtokr;
@@ -1607,260 +1858,257 @@ shutdownsock(DESC * d, int reason)
 
     DPUSH; /* #6 */
     i_addflags = 0;
-    if ( d->flags & DS_API ) {
-       i_addflags = MF_API;
+    if (d->flags & DS_API) {
+        i_addflags = MF_API;
     }
 
-    if ( ((reason == R_LOGOUT) || (reason == R_SU)) &&
-         (site_check((d->address).sin_addr, mudstate.access_list, 1, 0, H_FORBIDDEN) == H_FORBIDDEN)) {
-	reason = R_QUIT;
-        if( d->flags & DS_API ) {
-           reason = R_API; 
+    if (((reason == R_LOGOUT) || (reason == R_SU)) &&
+        (site_check((d->address).sin_addr, mudstate.access_list, 1, 0, H_FORBIDDEN) == H_FORBIDDEN)) {
+        reason = R_QUIT;
+        if (d->flags & DS_API) {
+            reason = R_API;
         }
     }
 
     if (d->flags & DS_CONNECTED) {
 
         handle_conninfo_write(d, d->player, CONN_ALL); /* Write A_CONNINFO */
-	strncpy(all, Name(d->player), 5);
-	*(all + 5) = '\0';
-        if ( strlen(mudconf.guest_namelist) > 0 ) {
-           memset(tsitebuff, 0, sizeof(tsitebuff));
-           strncpy(tsitebuff, mudconf.guest_namelist, 1000);
-           ptsitebuff = strtok_r(tsitebuff, " \t", &tstrtokr);
-           sitecntr = 1;
-           while ( (ptsitebuff != NULL) && (sitecntr < 32) ) {
-              if ( lookup_player(NOTHING, ptsitebuff, 0) == d->player ) {
-                 temp1 = sitecntr;
-                 temp2 = 0x00000001;
-                 temp2 <<= (temp1 - 1);
-                 mudstate.guest_status &= ~temp2;
-                 mudstate.guest_num--;
-              }
-              ptsitebuff = strtok_r(NULL, " \t", &tstrtokr);
-              sitecntr++;
-           }
+        strncpy(all, Name(d->player), 5);
+        *(all + 5) = '\0';
+        if (strlen(mudconf.guest_namelist) > 0) {
+            memset(tsitebuff, 0, sizeof(tsitebuff));
+            strncpy(tsitebuff, mudconf.guest_namelist, 1000);
+            ptsitebuff = strtok_r(tsitebuff, " \t", &tstrtokr);
+            sitecntr = 1;
+            while ((ptsitebuff != NULL) && (sitecntr < 32)) {
+                if (lookup_player(NOTHING, ptsitebuff, 0) == d->player) {
+                    temp1 = sitecntr;
+                    temp2 = 0x00000001;
+                    temp2 <<= (temp1 - 1);
+                    mudstate.guest_status &= ~temp2;
+                    mudstate.guest_num--;
+                }
+                ptsitebuff = strtok_r(NULL, " \t", &tstrtokr);
+                sitecntr++;
+            }
         } else if (!stricmp(all, "guest")) {
-	    temp1 = atoi((Name(d->player) + 5));
-	    temp2 = 0x00000001;
-	    temp2 <<= (temp1 - 1);
-	    mudstate.guest_status &= ~temp2;
-	    mudstate.guest_num--;
-	}
-	if (mudconf.maildelete)
-	    mail_md1(d->player, d->player, 1, -1);
-	strcpy(all, "all");
-	mail_mark(d->player, M_READM, all, NOTHING, 1);
-	atr_clr(d->player, A_MPSET);
-	atr_clr(d->player, A_MCURR);
+            temp1 = atoi((Name(d->player) + 5));
+            temp2 = 0x00000001;
+            temp2 <<= (temp1 - 1);
+            mudstate.guest_status &= ~temp2;
+            mudstate.guest_num--;
+        }
+        if (mudconf.maildelete)
+            mail_md1(d->player, d->player, 1, -1);
+        strcpy(all, "all");
+        mail_mark(d->player, M_READM, all, NOTHING, 1);
+        atr_clr(d->player, A_MPSET);
+        atr_clr(d->player, A_MCURR);
 
-	/* Do the disconnect stuff if we aren't doing a LOGOUT
-	 * (which keeps the connection open so the player can connect
-	 * to a different character).
-	 */
+        /* Do the disconnect stuff if we aren't doing a LOGOUT
+         * (which keeps the connection open so the player can connect
+         * to a different character).
+         */
 
-	if ( (reason != R_LOGOUT) && (reason != R_SU) ) {
-	    fcache_dump(d, FC_QUIT, (char *)NULL);
-	    STARTLOG(LOG_NET | LOG_LOGIN, "NET", "DISC")
-		buff = alloc_lbuf("shutdownsock.LOG.disconn");
-	    sprintf(buff, "[%d/%s] Logout by ",
-		    d->descriptor, d->longaddr);
-	    log_text(buff);
-	    log_name(d->player);
-	    sprintf(buff, " <Reason: %s>",
-		    disc_reasons[reason]);
-	    log_text(buff);
-	    free_lbuf(buff);
-	    ENDLOG
-	} else {
-	    STARTLOG(LOG_NET | LOG_LOGIN, "NET", "LOGO")
-		buff = alloc_lbuf("shutdownsock.LOG.logout");
-	    sprintf(buff, "[%d/%s] Logout by ",
-		    d->descriptor, d->longaddr);
-	    log_text(buff);
-	    log_name(d->player);
-	    sprintf(buff, " <Reason: %s>",
-		    disc_reasons[reason]);
-	    log_text(buff);
-	    free_lbuf(buff);
-	    ENDLOG
-	}
+        if ((reason != R_LOGOUT) && (reason != R_SU)) {
+            fcache_dump(d, FC_QUIT, (char *) NULL);
+            STARTLOG(LOG_NET | LOG_LOGIN, "NET", "DISC")
+            buff = alloc_lbuf("shutdownsock.LOG.disconn");
+            sprintf(buff, "[%d/%s] Logout by ", d->descriptor, d->longaddr);
+            log_text(buff);
+            log_name(d->player);
+            sprintf(buff, " <Reason: %s>", disc_reasons[reason]);
+            log_text(buff);
+            free_lbuf(buff);
+            ENDLOG
+        } else {
+            STARTLOG(LOG_NET | LOG_LOGIN, "NET", "LOGO")
+            buff = alloc_lbuf("shutdownsock.LOG.logout");
+            sprintf(buff, "[%d/%s] Logout by ", d->descriptor, d->longaddr);
+            log_text(buff);
+            log_name(d->player);
+            sprintf(buff, " <Reason: %s>", disc_reasons[reason]);
+            log_text(buff);
+            free_lbuf(buff);
+            ENDLOG
+        }
 
-	/* If requested, write an accounting record of the form:
-	 * Plyr# Flags Cmds ConnTime Loc Money [Site] <DiscRsn> Name
-	 */
+        /* If requested, write an accounting record of the form:
+         * Plyr# Flags Cmds ConnTime Loc Money [Site] <DiscRsn> Name
+         */
 
-	STARTLOG(LOG_ACCOUNTING, "DIS", "ACCT")
-	    now = mudstate.now - d->connected_at;
-	buff = alloc_lbuf("shutdownsock.LOG.accnt");
-	buff2 = decode_flags(GOD, GOD, Flags(d->player),
-			     Flags2(d->player), Flags3(d->player),
-			     Flags4(d->player));
-	sprintf(buff, "%d %s %d %ld %d %d [%s] <%s> %s",
-		d->player, buff2, d->command_count, now,
-		Location(d->player), Pennies(d->player),
-		d->longaddr, disc_reasons[reason],
-		Name(d->player));
-	log_text(buff);
-	free_lbuf(buff);
-	free_mbuf(buff2);
-	ENDLOG
-	announce_disconnect(d->player, d, disc_messages[reason]);
+        STARTLOG(LOG_ACCOUNTING, "DIS", "ACCT")
+        now = mudstate.now - d->connected_at;
+        buff = alloc_lbuf("shutdownsock.LOG.accnt");
+        buff2 = decode_flags(GOD, GOD, Flags(d->player), Flags2(d->player), Flags3(d->player), Flags4(d->player));
+        sprintf(buff, "%d %s %d %ld %d %d [%s] <%s> %s", d->player, buff2, d->command_count, now, Location(d->player),
+                Pennies(d->player), d->longaddr, disc_reasons[reason], Name(d->player));
+        log_text(buff);
+        free_lbuf(buff);
+        free_mbuf(buff2);
+        ENDLOG
+        announce_disconnect(d->player, d, disc_messages[reason]);
     } else {
-	if ( (reason == R_LOGOUT) || (reason == R_SU) ) {
-	    reason = R_QUIT;
+        if ((reason == R_LOGOUT) || (reason == R_SU)) {
+            reason = R_QUIT;
         }
-        if ( d->flags & DS_API ) {
-	    reason = R_API;
+        if (d->flags & DS_API) {
+            reason = R_API;
         }
-        if ( d->flags & DS_WEBSOCKETS ) {
-	    reason = R_WEBSOCKETS;
+        if (d->flags & DS_WEBSOCKETS) {
+            reason = R_WEBSOCKETS;
         }
-	STARTLOG(LOG_SECURITY | LOG_NET, "NET", "DISC")
-	    buff = alloc_lbuf("shutdownsock.LOG.neverconn");
-	sprintf(buff,
-		"[%d/%s] Connection closed, never connected. <Reason: %s>",
-		d->descriptor, d->longaddr, disc_reasons[reason]);
-	log_text(buff);
-	free_lbuf(buff);
-	ENDLOG
+        STARTLOG(LOG_SECURITY | LOG_NET, "NET", "DISC")
+        buff = alloc_lbuf("shutdownsock.LOG.neverconn");
+        sprintf(buff, "[%d/%s] Connection closed, never connected. <Reason: %s>", d->descriptor, d->longaddr,
+                disc_reasons[reason]);
+        log_text(buff);
+        free_lbuf(buff);
+        ENDLOG
     }
     process_output(d);
     process_door_output(d);
     clearstrings(d);
+    if (d->telnet) {
+        telnet_free(d->telnet);
+        d->telnet = NULL;
+    }
     i_sitecnt = i_guestcnt = 0;
-    if (d->flags & DS_HAS_DOOR) closeDoorWithId(d, d->door_num);
-    if ( (reason == R_LOGOUT) || (reason == R_SU) ) {
+    if (d->flags & DS_HAS_DOOR)
+        closeDoorWithId(d, d->door_num);
+    if ((reason == R_LOGOUT) || (reason == R_SU)) {
         addroutbuf = (char *) addrout((d->address).sin_addr, (d->flags & DS_API));
         t_addroutbuf = alloc_lbuf("check_max_sitecons");
         strcpy(t_addroutbuf, addroutbuf);
-        if ( t_addroutbuf ) {
-           DESC_SAFEITER_ALL(dchk, dchknext) {
-              if ( strcmp(t_addroutbuf, dchk->addr) == 0 ) {
-                 if ( Good_chk(dchk->player) && Guest(dchk->player) ) {
-                    i_guestcnt++;
-                 }
-                 i_sitecnt++;
-              }
-           }
+        if (t_addroutbuf) {
+            DESC_SAFEITER_ALL(dchk, dchknext) {
+                if (strcmp(t_addroutbuf, dchk->addr) == 0) {
+                    if (Good_chk(dchk->player) && Guest(dchk->player)) {
+                        i_guestcnt++;
+                    }
+                    i_sitecnt++;
+                }
+            }
         }
         free_lbuf(t_addroutbuf);
-	d->flags &= ~DS_CONNECTED;
-	d->connected_at = mudstate.now;
-	d->retries_left = mudconf.retry_limit;
-	d->regtries_left = mudconf.regtry_limit;
-	d->command_count = 0;
-	d->timeout = mudconf.idle_timeout;
-	d->player = 0;
-	d->doing[0] = '\0';
-	d->quota = mudconf.cmd_quota_max;
-	d->last_time = 0;
-	d->host_info = (site_check((d->address).sin_addr, mudstate.access_list, 1, 0, 0) & ~0x4) | 
-	    			  site_check((d->address).sin_addr,
-				  mudstate.suspect_list, 0, 0, 0);
+        d->flags &= ~DS_CONNECTED;
+        d->connected_at = mudstate.now;
+        d->retries_left = mudconf.retry_limit;
+        d->regtries_left = mudconf.regtry_limit;
+        d->command_count = 0;
+        d->timeout = mudconf.idle_timeout;
+        d->player = 0;
+        d->doing[0] = '\0';
+        d->quota = mudconf.cmd_quota_max;
+        d->last_time = 0;
+        d->host_info = (site_check((d->address).sin_addr, mudstate.access_list, 1, 0, 0) & ~0x4) |
+                       site_check((d->address).sin_addr, mudstate.suspect_list, 0, 0, 0);
         i_sitemax = site_check((d->address).sin_addr, mudstate.access_list, 1, 1, H_FORBIDDEN);
-        if ( (i_sitemax != -1) && (i_sitecnt < (i_sitemax + 1)) )
-           d->host_info &= ~H_FORBIDDEN;
+        if ((i_sitemax != -1) && (i_sitecnt < (i_sitemax + 1)))
+            d->host_info &= ~H_FORBIDDEN;
         i_sitemax = site_check((d->address).sin_addr, mudstate.access_list, 1, 1, H_REGISTRATION);
-        if ( (i_sitemax != -1) && (i_sitecnt < (i_sitemax + 1)) )
-           d->host_info &= ~H_REGISTRATION;
+        if ((i_sitemax != -1) && (i_sitecnt < (i_sitemax + 1)))
+            d->host_info &= ~H_REGISTRATION;
         i_sitemax = site_check((d->address).sin_addr, mudstate.access_list, 1, 1, H_NOGUEST);
-        if ( (i_sitemax != -1) && (i_guestcnt < (i_sitemax + 1)) )
-           d->host_info &= ~H_NOGUEST;
+        if ((i_sitemax != -1) && (i_guestcnt < (i_sitemax + 1)))
+            d->host_info &= ~H_NOGUEST;
         i_sitemax = site_check((d->address).sin_addr, mudstate.access_list, 1, 1, H_HARDCONN);
-        if ( i_sitemax != -1 ) 
-           d->host_info &= ~H_HARDCONN;
+        if (i_sitemax != -1)
+            d->host_info &= ~H_HARDCONN;
 
         memset(tchbuff, 0, sizeof(tchbuff));
         strcpy(tchbuff, mudconf.forbid_host);
-        if ((char *)mudconf.forbid_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
-           d->host_info = d->host_info | H_FORBIDDEN;
+        if ((char *) mudconf.forbid_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
+            d->host_info = d->host_info | H_FORBIDDEN;
         strcpy(tchbuff, mudconf.register_host);
-        if ((char *)mudconf.register_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
-           d->host_info = d->host_info | H_REGISTRATION;
-        if ( blacklist_check((d->address).sin_addr, 2) ) {
-           d->host_info = d->host_info | H_REGISTRATION;
+        if ((char *) mudconf.register_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
+            d->host_info = d->host_info | H_REGISTRATION;
+        if (blacklist_check((d->address).sin_addr, 2)) {
+            d->host_info = d->host_info | H_REGISTRATION;
         }
         strcpy(tchbuff, mudconf.autoreg_host);
-        if ((char *)mudconf.autoreg_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
-           d->host_info = d->host_info | H_NOAUTOREG;
+        if ((char *) mudconf.autoreg_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
+            d->host_info = d->host_info | H_NOAUTOREG;
         strcpy(tchbuff, mudconf.noguest_host);
-        if ((char *)mudconf.noguest_host && lookup(d->longaddr, tchbuff, i_guestcnt, &i_retvar))
-           d->host_info = d->host_info | H_NOGUEST;
-        if ( blacklist_check((d->address).sin_addr, 3) ) {
-           d->host_info = d->host_info | H_NOGUEST;
+        if ((char *) mudconf.noguest_host && lookup(d->longaddr, tchbuff, i_guestcnt, &i_retvar))
+            d->host_info = d->host_info | H_NOGUEST;
+        if (blacklist_check((d->address).sin_addr, 3)) {
+            d->host_info = d->host_info | H_NOGUEST;
         }
         strcpy(tchbuff, mudconf.suspect_host);
-        if ((char *)mudconf.suspect_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
-           d->host_info = d->host_info | H_SUSPECT;
+        if ((char *) mudconf.suspect_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
+            d->host_info = d->host_info | H_SUSPECT;
         strcpy(tchbuff, mudconf.passproxy_host);
-        if ((char *)mudconf.passproxy_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
-           d->host_info = d->host_info | H_PASSPROXY;
+        if ((char *) mudconf.passproxy_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
+            d->host_info = d->host_info | H_PASSPROXY;
         strcpy(tchbuff, mudconf.hardconn_host);
-        if ((char *)mudconf.hardconn_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
-           d->host_info = d->host_info | H_HARDCONN;
-	d->input_tot = d->input_size;
-	d->output_tot = 0;
-         
+        if ((char *) mudconf.hardconn_host && lookup(d->longaddr, tchbuff, i_sitecnt, &i_retvar))
+            d->host_info = d->host_info | H_HARDCONN;
+        d->input_tot = d->input_size;
+        d->output_tot = 0;
+
         mudstate.total_bytesin += d->input_size;
-        if ( (mudstate.reset_daily_bytes + 86400) < mudstate.now ) {
-           if ( mudstate.avg_bytesin == 0 ) {
-              mudstate.avg_bytesin = mudstate.daily_bytesin;
-           } else {
-              mudstate.avg_bytesin = (mudstate.avg_bytesin + mudstate.daily_bytesin) / 2;
-           }
-           if ( mudstate.avg_bytesout == 0 ) {
-              mudstate.avg_bytesout = mudstate.daily_bytesout;
-           } else {
-              mudstate.avg_bytesout = (mudstate.avg_bytesout + mudstate.daily_bytesout) / 2;
-           }
-           mudstate.daily_bytesout = 0;
-           mudstate.daily_bytesin = d->input_size;
-           mudstate.reset_daily_bytes = time(NULL);
+        if ((mudstate.reset_daily_bytes + 86400) < mudstate.now) {
+            if (mudstate.avg_bytesin == 0) {
+                mudstate.avg_bytesin = mudstate.daily_bytesin;
+            } else {
+                mudstate.avg_bytesin = (mudstate.avg_bytesin + mudstate.daily_bytesin) / 2;
+            }
+            if (mudstate.avg_bytesout == 0) {
+                mudstate.avg_bytesout = mudstate.daily_bytesout;
+            } else {
+                mudstate.avg_bytesout = (mudstate.avg_bytesout + mudstate.daily_bytesout) / 2;
+            }
+            mudstate.daily_bytesout = 0;
+            mudstate.daily_bytesin = d->input_size;
+            mudstate.reset_daily_bytes = time(NULL);
         } else {
-           mudstate.daily_bytesin += d->input_size;
+            mudstate.daily_bytesin += d->input_size;
         }
- 
-	/* free up the snooplist before freeing the desc -Thorin */
-          
-	while (d->snooplist) {
-	    temp = d->snooplist->next;
-	    if (d->snooplist->sfile) {
-		fprintf(d->snooplist->sfile, "Snoop stopped due to logout: (%ld) %s", mudstate.now, ctime(&mudstate.now));
-		fclose(d->snooplist->sfile);
-	    }
-	    free(d->snooplist);
-	    d->snooplist = temp;
-	}
-	d->snooplist = NULL;
-	d->logged = 0;
-        if ( !mudstate.no_announce ) {
-	   welcome_user(d);
+
+        /* free up the snooplist before freeing the desc -Thorin */
+
+        while (d->snooplist) {
+            temp = d->snooplist->next;
+            if (d->snooplist->sfile) {
+                fprintf(d->snooplist->sfile, "Snoop stopped due to logout: (%ld) %s", mudstate.now,
+                        ctime(&mudstate.now));
+                fclose(d->snooplist->sfile);
+            }
+            free(d->snooplist);
+            d->snooplist = temp;
+        }
+        d->snooplist = NULL;
+        d->logged = 0;
+        if (!mudstate.no_announce) {
+            welcome_user(d);
         }
     } else {
-	broadcast_monitor(NOTHING, MF_CONN | i_addflags, "PORT DISCONNECT", d->userid, d->longaddr, d->descriptor, 0, 0, (char *)disc_reasons[reason]);
-	shutdown(d->descriptor, 2);
-	close(d->descriptor);
-	freeqs(d,0); /* 0 is for all */
-	*d->prev = d->next;
-	if (d->next)
-	    d->next->prev = d->prev;
-	/* free up the snooplist before freeing the desc -Thorin */
-	while (d->snooplist) {
-	    temp = d->snooplist->next;
-	    if (d->snooplist->sfile) {
-		fprintf(d->snooplist->sfile, "Snoop stopped due to shutdown of descriptor: (%ld) %s", mudstate.now, ctime(&mudstate.now));
-		fclose(d->snooplist->sfile);
-	    }
-	    free(d->snooplist);
-	    d->snooplist = temp;
-	}
-	if (d->flags & DS_AUTH_IN_PROGRESS) {
-	    shutdown(d->authdescriptor, 2);
-	    close(d->authdescriptor);
-	}
-	free_desc(d);
-	ndescriptors--;
+        broadcast_monitor(NOTHING, MF_CONN | i_addflags, "PORT DISCONNECT", d->userid, d->longaddr, d->descriptor, 0, 0,
+                          (char *) disc_reasons[reason]);
+        shutdown(d->descriptor, 2);
+        close(d->descriptor);
+        freeqs(d, 0); /* 0 is for all */
+        *d->prev = d->next;
+        if (d->next)
+            d->next->prev = d->prev;
+        /* free up the snooplist before freeing the desc -Thorin */
+        while (d->snooplist) {
+            temp = d->snooplist->next;
+            if (d->snooplist->sfile) {
+                fprintf(d->snooplist->sfile, "Snoop stopped due to shutdown of descriptor: (%ld) %s", mudstate.now,
+                        ctime(&mudstate.now));
+                fclose(d->snooplist->sfile);
+            }
+            free(d->snooplist);
+            d->snooplist = temp;
+        }
+        if (d->flags & DS_AUTH_IN_PROGRESS) {
+            shutdown(d->authdescriptor, 2);
+            close(d->authdescriptor);
+        }
+        free_desc(d);
+        ndescriptors--;
     }
     DPOP; /* #6 */
 }
@@ -2273,6 +2521,7 @@ initializesock(int s, struct sockaddr_in * a, char *addr, int i_keyflag, int key
     memset(d->longaddr, '\0', sizeof(d->longaddr)); /* Null terminate this sucker too */
     strncpy(d->longaddr, addr, 255);
     d->address = *a;		/* added 5/3/90 SCG */
+    d->telnet = NULL;
     if (descriptor_list)
 	descriptor_list->prev = &d->next;
     d->hashnext = NULL;
@@ -2467,8 +2716,7 @@ static int
 process_input(DESC *d)
 {
     static char buf[LBUF_SIZE];
-    int got, in, lost, in_get;
-    char *p, *pend, *q, *qend, qfind[SBUF_SIZE], *qf, *tmpptr = NULL, tmpbuf[SBUF_SIZE];
+    int got;
     char *cmdsave;
 #ifdef ENABLE_WEBSOCKETS
     ///// NEW WEBSOCK #ifdef ENABLE_WEBSOCKETS
@@ -2480,9 +2728,7 @@ process_input(DESC *d)
     cmdsave = mudstate.debug_cmd;
     mudstate.debug_cmd = (char *) "< process_input >";
 
-    memset(qfind, '\0', sizeof(qfind));
-    memset(tmpbuf, '\0', sizeof(tmpbuf));
-    got = in = READ(d->descriptor, buf, sizeof buf);
+    got = READ(d->descriptor, buf, sizeof buf);
     if (got <= 0) {
         mudstate.debug_cmd = cmdsave;
         RETURN(0); /* #16 */
@@ -2496,134 +2742,15 @@ process_input(DESC *d)
     }
 ///// END NEW WEBSOCK #endif
 #endif
-    if (!d->raw_input) {
-        d->raw_input = (CBLK *) alloc_lbuf("process_input.raw");
-        d->raw_input_at = d->raw_input->cmd;
-    }
-    p = d->raw_input_at;
-    pend = d->raw_input->cmd + LBUF_SIZE - sizeof(CBLKHDR) - 1;
-    lost = 0;
-    in_get = 1;
-    if (d->flags & DS_API) {
-        in_get = 0;
-    }
-    // fprintf(stderr, "Test: %s\nVal: %d", buf, in_get);
 
-    // Iterates over received buf.
-    for (q = buf, qend = buf + got; q < qend; q++) {
-        /* newlines terminate MUSH commands. */
-        if ((*q == '\n') && (!(d->flags & DS_API) || (!in_get && ((q + 10) > qend) && (d->flags & DS_API)))) {
-            *p = '\0';
-            if (p > d->raw_input->cmd) {
-                save_command(d, d->raw_input);
-                /* We need a new buffer now. Let's allocate one and initialize our indexes. */
-                d->raw_input = (CBLK *) alloc_lbuf("process_input.raw");
-                p = d->raw_input_at = d->raw_input->cmd;
-                pend = d->raw_input->cmd + LBUF_SIZE - sizeof(CBLKHDR) - 1;
-            } else {
-                in -= 1; /* for newline */
-            }
-        /* handle the delete character for people using old-style terminal connections */
-        } else if ((*q == '\b') || (*q == 127)) {
-            /* Anything that sent in DEL probably needs to have it echoed back. */
-            queue_string(d, (*q == 127) ? "\b \b" : " \b");
-            in -= 2;
-            if (p > d->raw_input->cmd)
-                p--;
-            if (p < d->raw_input_at)
-                (d->raw_input_at)--;
-        /* Display char 255  -- no need for accent_extend as it's handled in eval.c */
-        } else if ((((int) (unsigned char) *q) == 255) && *(q + 1) && (((int) (unsigned char) *(q + 1)) == 255)) {
-            sprintf(qfind, "%c<%3d>", '%', (int) (unsigned char) *q);
-            in += 5;
-            got += 5;
-            qf = qfind;
-            while (*qf) {
-                *p++ = *qf++;
-            }
-            q++;
-            /* This is telnet negotiation -- we eat telnet negotiation */
-        } else if ((((int) (unsigned char) *q) == 255) && *(q + 1) && (((int) (unsigned char) *(q + 1)) != 255)) {
-            q++;
-            /* Else let's print printables -- This is ASCII-7 [0-128] */
-        } else if (p < pend && ((*q == '\n') || (isascii((int) *q) && isprint((int) *q)))) {
-            *p++ = *q;
-        } else if (((p + 13) < pend) && *q && *(q + 1) && *(q + 2) && *(q + 3) && IS_4BYTE((int) (unsigned char) *q) &&
-                   IS_CBYTE(*(q + 1)) && IS_CBYTE(*(q + 2)) && IS_CBYTE(*(q + 3))) {
-            sprintf(tmpbuf, "%02x%02x%02x%02x", (int) (unsigned char) *q, (int) (unsigned char) *(q + 1),
-                    (int) (unsigned char) *(q + 2), (int) (unsigned char) *(q + 3));
-            tmpptr = encode_utf8(tmpbuf);
-            sprintf(qfind, "%s", tmpptr);
-            free_sbuf(tmpptr);
-
-            q += 3;
-            in += 12;
-            got += 12;
-            qf = qfind;
-            while (*qf) {
-                *p++ = *qf++;
-            }
-        } else if (((p + 13) < pend) && *q && *(q + 1) && *(q + 2) && IS_3BYTE((int) (unsigned char) *q) &&
-                   IS_CBYTE(*(q + 1)) && IS_CBYTE(*(q + 2))) {
-            sprintf(tmpbuf, "%02x%02x%02x", (int) (unsigned char) *q, (int) (unsigned char) *(q + 1),
-                    (int) (unsigned char) *(q + 2));
-            tmpptr = encode_utf8(tmpbuf);
-            sprintf(qfind, "%s", tmpptr);
-            free_sbuf(tmpptr);
-
-            q += 2;
-            in += 10;
-            got += 10;
-            qf = qfind;
-            while (*qf) {
-                *p++ = *qf++;
-            }
-        } else if (((p + 13) < pend) && *q && *(q + 1) && IS_2BYTE((int) (unsigned char) *q) && IS_CBYTE(*(q + 1))) {
-            sprintf(tmpbuf, "%02x%02x", (int) (unsigned char) *q, (int) (unsigned char) *(q + 1));
-            tmpptr = encode_utf8(tmpbuf);
-            sprintf(qfind, "%s", tmpptr);
-            free_sbuf(tmpptr);
-
-            q += 1;
-            in += 8;
-            got += 8;
-            qf = qfind;
-            while (*qf) {
-                *p++ = *qf++;
-            }
-            /* Let's handle accents [129-255] -- no accent_extend here as it's handled in eval.c in parse_ansi */
-        } else if ((((int) (unsigned char) *q) > 160) && (((int) (unsigned char) *q) < 256) && ((p + 10) < pend)) {
-            sprintf(qfind, "%c<%3d>", '%', (int) (unsigned char) *q);
-            in += 5;
-            got += 5;
-            qf = qfind;
-            while (*qf) {
-                *p++ = *qf++;
-            }
-        } else {
-            in--;
-            if (p >= pend)
-                lost++;
-        }
-    }
-
-    if (p > d->raw_input->cmd) {
-        d->raw_input_at = p;
-    } else {
-        free_lbuf(d->raw_input);
-        d->raw_input = NULL;
-        d->raw_input_at = NULL;
+    if (d->telnet) {
+        telnet_recv(d->telnet, buf, got);
     }
 
     if (got > 0) {
         d->input_tot += got;
         record_more_bytes(got);
     }
-
-    if (in > 0)
-        d->input_size += in;
-    if (lost > 0)
-        d->input_lost += lost;
 
     mudstate.debug_cmd = cmdsave;
     RETURN(1); /* #16 */
