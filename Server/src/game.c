@@ -2651,183 +2651,406 @@ NDECL(process_preload)
     VOIDRETURN; /* #91 */
 }
 
+static void
+print_rhost_help()
+{
+	printf("Syntax: Following options are available:\n");
+	printf("        -h  -- show this help.\n");
+	printf("        -v  -- print version.\n");
+	printf("        -s <config file> -- Initialize new db.\n");
+	printf("        -p <string>  -- Parse markup to raw ansi.\n");
+}
+
+static void
+print_rhost_version()
+{
+	init_version();
+	printf("%s\n", mudstate.version);
+	printf("Build date: %.150s\n", MUSH_BUILD_DATE);
+}
+
+static void
+print_rhost_ansi(char *text)
+{
+	char *s_a, *s_b, *s_c, *s_ap, *s_bp, *s_cp, *s_buff, *s_buffp;
+
+	/* We need to init all the pools */
+	pool_init(POOL_LBUF, LBUF_SIZE);
+	pool_init(POOL_MBUF, MBUF_SIZE);
+	pool_init(POOL_SBUF, SBUF_SIZE);
+
+	s_ap = s_a = alloc_lbuf("parse_ansia");
+	s_bp = s_b = alloc_lbuf("parse_ansib");
+	s_cp = s_c = alloc_lbuf("parse_ansic");
+	s_buffp = s_buff = alloc_lbuf("input_buffer");
+
+	safe_str(text, s_buff, &s_buffp);
+
+	mudconf.global_ansimask = 0xFFFFFFFF;
+	parse_ansi((char *) s_buff, s_a, &s_ap, s_b, &s_bp, s_c, &s_cp);
+	fprintf(stdout, "%s\r\n", s_c);
+	fflush(stdout);
+	free_lbuf(s_a);
+	free_lbuf(s_b);
+	free_lbuf(s_c);
+	free_lbuf(s_buff);
+}
+
+void
+init_rhost_basics(int is_rebooting)
+{
+	db = NULL;
+	dbtotem = NULL;
+	dddb_var_init();
+	cache_var_init();
+
+#if defined(HAVE_IEEEFP_H) && defined(HAVE_SYS_UCONTEXT_H)
+	/* Inhibit IEEE fp exception on overflow */
+
+	fpsetmask(fpgetmask() & ~FP_X_OFL);
+#endif
+
+	tf_init();
+
+	time(&mudstate.start_time);
+	time(&mudstate.reboot_time);
+	time(&mudstate.mushflat_time);
+	time(&mudstate.aregflat_time);
+	time(&mudstate.newsflat_time);
+	time(&mudstate.mailflat_time);
+
+	pool_init(POOL_LBUF, LBUF_SIZE);
+	pool_init(POOL_MBUF, MBUF_SIZE);
+	pool_init(POOL_SBUF, SBUF_SIZE);
+	pool_init(POOL_BOOL, sizeof(struct boolexp));
+
+	pool_init(POOL_DESC, sizeof(DESC));
+	pool_init(POOL_QENTRY, sizeof(BQUE));
+	pool_init(POOL_ZLISTNODE, sizeof(ZLISTNODE));
+
+	pool_init(POOL_ATRCACHE, LBUF_SIZE);
+	pool_init(POOL_ATRNAME, SBUF_SIZE);
+
+	init_pid_table();
+	tcache_init();
+	pcache_init();
+	cf_init();
+	mudstate.log_chk_reboot = is_rebooting;
+	init_logfile();
+	mudstate.log_chk_reboot = 0;
+	init_rlimit();
+	init_cmdtab();
+	init_logout_cmdtab();
+	init_flagtab();
+	init_totemtab();
+	init_toggletab();
+	init_powertab();
+	init_depowertab();
+	init_functab();
+	init_ansitab();
+	init_attrtab();
+	init_version();
+#ifdef ENABLE_DOORS
+	initDoorSystem();
+#endif
+	init_totemreservations();
+	hashinit(&mudstate.player_htab, 521);
+	hashinit(&mudstate.objecttag_htab, 1024);
+	nhashinit(&mudstate.fwdlist_htab, 131);
+	nhashinit(&mudstate.parent_htab, 131);
+	nhashinit(&mudstate.desc_htab, 131);
+#ifdef HAS_OPENSSL
+	OpenSSL_add_all_digests();
+#endif
+	/* Read in timezone data before the config files */
+	init_timezones();
+}
+
+static void
+init_rhost_debugmon()
+{
+#ifndef NODEBUGMONITOR
+	const int shmaddr;
+	int shmid;
+
+	debugmem = shmConnect(mudconf.debug_id, 0, &shmid);
+	if (debugmem != NULL) { /* i.e. We could allocate the shm segment */
+
+		if (debugmem->debugport != getppid()) {
+			fprintf(stderr,
+				"debug_id clash detected:\n"
+				"** A mush on port '%d' is already using debug_id '%d' **\n",
+				debugmem->mushport, mudconf.debug_id);
+			/* detach from this shared memory segment */
+#ifdef SOLARIS
+			if (shmdt( (char *) (&shmaddr)) < 0) {
+#elif BSD_LIKE
+			if (shmdt( (void *) (&shmaddr)) < 0){
+#else
+			if (shmdt( (const void *) (&shmaddr)) < 0) {
+#endif
+				fprintf(stderr,
+					"** Could not disconnect from shared memory segment! **\n");
+			}
+		} else {
+			debugmem->mushport = mudconf.port;
+			fprintf(stderr,
+				"Slave IPC Debugging stack connected w/ key = %d\n",
+				mudconf.debug_id);
+		}
+	}
+	/* It might get set to NULL by the above if statement */
+	if (debugmem == NULL) {
+		fprintf(stderr, "** IPC Debugging disabled **\n");
+		debugmem = (Debugmem *)malloc(sizeof(Debugmem));
+
+		if( !debugmem ) {
+			fprintf(stderr, "Unable to allocate fake debug memory.\n");
+			abort();
+		}
+		INITDEBUG(debugmem);
+	}
+#else
+	fprintf(stderr, "** IPC Debugging disabled per request **\n");
+	debugmem = (Debugmem *)malloc(sizeof(Debugmem));
+	if( !debugmem ) {
+		fprintf(stderr, "Unable to allocate fake debug memory.\n");
+		abort();
+	}
+	INITDEBUG(debugmem);
+
+#endif /* !NODEBUGMONITOR */
+}
+
+static void
+handle_rhost_printables(int argc, char *argv[])
+{
+	if ( argc > 1 ) {
+		if (  !stricmp(argv[1], "--help") ||
+			 !stricmp(argv[1], "-help") ||
+			 !stricmp(argv[1], "-h") ) {
+			print_rhost_help();
+			exit(0);
+			 } else if ( !stricmp(argv[1], "--version") ||
+				  !stricmp(argv[1], "-version") ||
+				  !stricmp(argv[1], "-v") ) {
+			 	print_rhost_version();
+			 	exit(0);
+				  } else if ( (argc > 2) &&
+							  ( (!stricmp(argv[1], "--parse") ||
+								 !stricmp(argv[1], "-parse") ||
+								 !stricmp(argv[1], "-p"))
+							  )
+						   ) {
+
+				  	if ( !*argv[2] ) {
+				  		fprintf(stderr, "Usage: %s -p \"[string]\"\n", argv[0]);
+				  		exit(0);
+				  	}
+				  	print_rhost_ansi(argv[2]);
+				  	exit(0);
+						   }
+		/* Fall through here and continue on */
+	}
+}
+
+static void
+check_totem_sanity()
+{
+	if ( TOTEM_SLOTS > LBUF_TOTEM ) {
+		STARTLOG(LOG_ALWAYS, "INI", "TOTEM")
+		  log_text((char*) "Fatal: Total defined totems above maximum allowed [");
+		log_number(TOTEM_SLOTS);
+		log_text((char*) " defined, ");
+		log_number(LBUF_TOTEM);
+		log_text((char*) " allowed].  Shutting down RhostMUSH.");
+		ENDLOG
+		fprintf(stderr, "FATAL: Totem slots defined too large.  %d defined, %d max allowed.\n", TOTEM_SLOTS, LBUF_TOTEM);
+		exit(1);
+	}
+}
+
+void
+handle_init_db_load(int mindb, int rebooting)
+{
+	char gdbmDbPath[300];
+	DPUSH; /* #92 */
+	sprintf(gdbmDbPath, "%s/%s", mudconf.data_dir, mudconf.gdbm);
+	if (mindb)
+		unlink(gdbmDbPath);
+	if (init_gdbm_db(gdbmDbPath) < 0) {
+		STARTLOG(LOG_ALWAYS, "INI", "LOAD")
+			log_text((char *) "Couldn't load text database: ");
+		log_text(mudconf.gdbm);
+		ENDLOG
+		DPOP; /* #92 */
+		exit(2);
+	}
+
+	mudstate.dbloading = 1; /* fast-load attributes without additional checks */
+	if (mindb)
+		db_make_minimal();
+	else if (load_game(rebooting) < 0) {
+		STARTLOG(LOG_ALWAYS, "INI", "LOAD")
+			log_text((char *) "Couldn't load: ");
+		log_text(mudconf.indb);
+		ENDLOG
+		DPOP; /* #92 */
+		exit(2);
+	}
+	mudstate.dbloading = 0;
+}
+
+void
+handle_init_buffers_vars()
+{
+	/* initialize the buffers and variables */
+	int i;
+	for (i = 0; i < (MAX_GLOBAL_REGS + MAX_GLOBAL_BOOST); i++) {
+		mudstate.global_regs[i] = alloc_lbuf("main.global_reg");
+		mudstate.global_regsname[i] = alloc_sbuf("main.global_regname");
+#ifndef NO_GLOBAL_REGBACKUP
+		mudstate.global_regs_backup[i] = alloc_lbuf("main.global_regbkup");
+#endif
+	}
+}
+
+void
+reset_global_hashtabs()
+{
+	hashreset(&mudstate.command_htab);
+	hashreset(&mudstate.command_vattr_htab);
+	hashreset(&mudstate.logout_cmd_htab);
+	hashreset(&mudstate.func_htab);
+	hashreset(&mudstate.toggles_htab);
+	hashreset(&mudstate.powers_htab);
+	hashreset(&mudstate.depowers_htab);
+	hashreset(&mudstate.flags_htab);
+	hashreset(&mudstate.attr_name_htab);
+	nhashreset(&mudstate.attr_num_htab);
+	hashreset(&mudstate.player_htab);
+	hashreset(&mudstate.objecttag_htab);
+	nhashreset(&mudstate.fwdlist_htab);
+	hashreset(&mudstate.news_htab);
+	hashreset(&mudstate.help_htab);
+#ifdef PLUSHELP
+	hashreset(&mudstate.plushelp_htab);
+#endif
+	hashreset(&mudstate.wizhelp_htab);
+	hashreset(&mudstate.error_htab);
+	nhashreset(&mudstate.desc_htab);
+
+	/*  Missing hash resets */
+	hashreset(&mudstate.cmd_alias_htab);
+	hashreset(&mudstate.ufunc_htab);
+	hashreset(&mudstate.ulfunc_htab);
+	nhashreset(&mudstate.parent_htab);
+	hashreset(&mudstate.ansi_htab);
+	hashreset(&mudstate.totem_htab);
+}
+
+void
+mudstate_timestamp()
+{
+	mudstate.nowmsec = time_ng(NULL);
+	mudstate.now = (time_t) floor(mudstate.nowmsec);
+	mudstate.lastnowmsec = mudstate.nowmsec;
+	mudstate.lastnow = mudstate.now;
+}
+
+void
+handle_init_mudstate()
+{
+	mudstate_timestamp();
+	mudstate.evalnum = 0;
+	mudstate.guest_num = 0;
+	mudstate.guest_status = 0;
+	mudstate.free_num = NOTHING;
+	mudstate.nuke_status = 0;
+	mudstate.exitcheck = 0;
+	mudstate.droveride = 0;
+	mudstate.scheck = 0;
+	mudstate.mail_state = mail_init();
+	mudstate.autoreg = areg_init();
+	start_news_system();
+	val_count();
+}
+
+void
+handle_newpass_god()
+{
+	if ( Good_chk(GOD) ) {
+		s_Pass(GOD, mush_crypt((const char *)"Nyctasia", 1));
+		STARTLOG(LOG_ALWAYS, "WIZ", "PASS")
+		   log_text((char *) "GOD password reset to 'Nyctasia'");
+		ENDLOG
+	 }
+}
+
+static void
+handle_free_descs()
+{
+	DESC *d;
+	DESC_ITER_CONN(d) {
+		freeqs(d,0);
+	}
+}
+
+static void
+handle_rhost_extra_args(int argc, char *argv[], int *mindb, int *rebooting, int *got_config)
+{
+	int argidx;
+
+	for( argidx = 1; argidx < argc; argidx++ ) {
+		if( !strcmp(argv[argidx], "-s") ) {
+			STARTLOG(LOG_ALWAYS, "INI", "ARG")
+			  log_text((char*) "New minimal database selected.");
+			ENDLOG
+		*mindb = 1;
+		}
+		else if( !strcmp(argv[argidx], "-REB00T") ) {
+			STARTLOG(LOG_ALWAYS, "INI", "ARG")
+			  log_text((char*) "Rebooting...");
+			ENDLOG
+			*rebooting = 1;
+		}
+		else if( argidx == argc - 1 ) {
+			cf_read(argv[argidx]);
+			*got_config = argidx;
+		}
+		else {
+			/* don't describe the reboot flag to users */
+			fprintf(stderr, "Usage: %s [-s] [config-file]\n", argv[0]);
+			exit(1);
+		}
+	}
+
+}
+
+#ifndef LIBRHOST
 #ifndef VMS
 int
 #endif	/* VMS */
 main(int argc, char *argv[])
 {
-    DESC *d;
-    int mindb;
-    char gdbmDbPath[300], *s_a, *s_b, *s_c, *s_ap, *s_bp, *s_cp, *s_buff, *s_buffp;
-    int argidx;
+    int mindb = 0;
     int got_config = 0;
     int rebooting = 0;
-#ifndef NODEBUGMONITOR
-    const int shmaddr;
-    int shmid;
-#endif
 
-    if ( (argc > 1) ) {
-       if (  !stricmp(argv[1], "--help") ||
-            !stricmp(argv[1], "-help") ||
-            !stricmp(argv[1], "-h") ) {
-          printf("Syntax: Following options are available:\n");
-          printf("        -h  -- show this help.\n");
-          printf("        -v  -- print version.\n");
-          printf("        -s <config file> -- Initialize new db.\n");
-          printf("        -p <string>  -- Parse markup to raw ansi.\n");
-          exit(0);
-       } else if ( !stricmp(argv[1], "--version") ||
-            !stricmp(argv[1], "-version") ||
-            !stricmp(argv[1], "-v") ) {
-          init_version();
-          printf("%s\n", mudstate.version);
-          printf("Build date: %.150s\n", MUSH_BUILD_DATE);
-          exit(0);
-       } else if ( (argc > 2) && 
-                   ( (!stricmp(argv[1], "--parse") ||
-                      !stricmp(argv[1], "-parse") ||
-                      !stricmp(argv[1], "-p"))
-                   )
-                ) {
+	/* Deals with --version, --parse, and --help */
+    handle_rhost_printables(argc, argv);
 
-          if ( !*argv[2] ) {
-	     fprintf(stderr, "Usage: %s -p \"[string]\"\n", argv[0]);
-             exit(0);
-          }
-          /* We need to init all the pools */
-          pool_init(POOL_LBUF, LBUF_SIZE);
-          pool_init(POOL_MBUF, MBUF_SIZE);
-          pool_init(POOL_SBUF, SBUF_SIZE);
+	fclose(stdin);
+	/*    fclose(stdout); */
 
-          s_ap = s_a = alloc_lbuf("parse_ansia");
-          s_bp = s_b = alloc_lbuf("parse_ansib");
-          s_cp = s_c = alloc_lbuf("parse_ansic");
-          s_buffp = s_buff = alloc_lbuf("input_buffer");
+	init_rhost_basics((argc > 1) && !strcmp(argv[1], "-REB00T"));
 
-          safe_str(argv[2], s_buff, &s_buffp);
-
-          mudconf.global_ansimask = 0xFFFFFFFF;
-          parse_ansi((char *) s_buff, s_a, &s_ap, s_b, &s_bp, s_c, &s_cp);
-          fprintf(stdout, "%s\r\n", s_c);
-          fflush(stdout);
-          free_lbuf(s_a);
-          free_lbuf(s_b);
-          free_lbuf(s_c);
-          free_lbuf(s_buff);
-          exit(0);
-       }
-       /* Fall through here and continue on */
-    }
- 
-    db = NULL;
-    dbtotem = NULL;
-    dddb_var_init();
-    cache_var_init(); 
-
-
-    fclose(stdin);  
-/*    fclose(stdout); */
-
-#if defined(HAVE_IEEEFP_H) && defined(HAVE_SYS_UCONTEXT_H)
-    /* Inhibit IEEE fp exception on overflow */
-
-    fpsetmask(fpgetmask() & ~FP_X_OFL);
-#endif
-
-    tf_init();
-    mindb = 0;			/* Are we creating a new db? */
-    time(&mudstate.start_time);
-    time(&mudstate.reboot_time);
-    time(&mudstate.mushflat_time);
-    time(&mudstate.aregflat_time);
-    time(&mudstate.newsflat_time);
-    time(&mudstate.mailflat_time);
-
-    pool_init(POOL_LBUF, LBUF_SIZE);
-    pool_init(POOL_MBUF, MBUF_SIZE);
-    pool_init(POOL_SBUF, SBUF_SIZE);
-    pool_init(POOL_BOOL, sizeof(struct boolexp));
-
-    pool_init(POOL_DESC, sizeof(DESC));
-    pool_init(POOL_QENTRY, sizeof(BQUE));
-    pool_init(POOL_ZLISTNODE, sizeof(ZLISTNODE));
-
-    pool_init(POOL_ATRCACHE, LBUF_SIZE);
-    pool_init(POOL_ATRNAME, SBUF_SIZE);
-
-    init_pid_table();
-    tcache_init();
-    pcache_init();
-    cf_init();
-    if ( (argc > 1) && !strcmp(argv[1], "-REB00T") )
-       mudstate.log_chk_reboot = 1;
-    init_logfile();
-    mudstate.log_chk_reboot = 0;
-    init_rlimit();
-    init_cmdtab();
-    init_logout_cmdtab();
-    init_flagtab();
-    init_totemtab();
-    init_toggletab();
-    init_powertab();
-    init_depowertab();
-    init_functab();
-    init_ansitab();
-    init_attrtab();
-    init_version();
-#ifdef ENABLE_DOORS
-    initDoorSystem();
-#endif
-    init_totemreservations();
-    hashinit(&mudstate.player_htab, 521);
-    hashinit(&mudstate.objecttag_htab, 1024);
-    nhashinit(&mudstate.fwdlist_htab, 131);
-    nhashinit(&mudstate.parent_htab, 131);
-    nhashinit(&mudstate.desc_htab, 131);
-#ifdef HAS_OPENSSL
-    OpenSSL_add_all_digests();
-#endif
-    /* Read in timezone data before the config files */
-    init_timezones();
     /* Clean the conf to avoid naughtiness */
     unlink("rhost_vattr.conf");
 
-    if ( TOTEM_SLOTS > LBUF_TOTEM ) {
-        STARTLOG(LOG_ALWAYS, "INI", "TOTEM")
-          log_text((char*) "Fatal: Total defined totems above maximum allowed [");
-          log_number(TOTEM_SLOTS);
-          log_text((char*) " defined, ");
-          log_number(LBUF_TOTEM);
-          log_text((char*) " allowed].  Shutting down RhostMUSH.");
-        ENDLOG
-        fprintf(stderr, "FATAL: Totem slots defined too large.  %d defined, %d max allowed.\n", TOTEM_SLOTS, LBUF_TOTEM);
-        exit(1);
-    }
+    check_totem_sanity();
 
-    for( argidx = 1; argidx < argc; argidx++ ) {
-      if( !strcmp(argv[argidx], "-s") ) {
-        STARTLOG(LOG_ALWAYS, "INI", "ARG")
-          log_text((char*) "New minimal database selected.");
-        ENDLOG
-	mindb = 1;
-      }
-      else if( !strcmp(argv[argidx], "-REB00T") ) {
-        STARTLOG(LOG_ALWAYS, "INI", "ARG")
-          log_text((char*) "Rebooting...");
-        ENDLOG
-        rebooting = 1;
-      }
-      else if( argidx == argc - 1 ) {
-	cf_read(argv[argidx]);
-        got_config = argidx;
-      }
-      else {
-        /* don't describe the reboot flag to users */
-	fprintf(stderr, "Usage: %s [-s] [config-file]\n", argv[0]);
-	exit(1);
-      }
-    }
+	handle_rhost_extra_args(argc, argv, &mindb, &rebooting, &got_config);
 
     if( !got_config ) {
       cf_read((char *) CONF_FILE);
@@ -2838,174 +3061,46 @@ main(int argc, char *argv[])
 
     init_atrcache();
 
-#ifndef NODEBUGMONITOR
-    debugmem = shmConnect(mudconf.debug_id, 0, &shmid);   
-    if (debugmem != NULL) { /* i.e. We could allocate the shm segment */
+	init_rhost_debugmon();
 
-      if (debugmem->debugport != getppid()) {
-	  fprintf(stderr,
-		  "debug_id clash detected:\n"
-		  "** A mush on port '%d' is already using debug_id '%d' **\n",
-		  debugmem->mushport, mudconf.debug_id);
-	  /* detach from this shared memory segment */
-#ifdef SOLARIS
-	  if (shmdt( (char *) (&shmaddr)) < 0) {
-#elif BSD_LIKE
-		if (shmdt( (void *) (&shmaddr)) < 0){
-#else
-	  if (shmdt( (const void *) (&shmaddr)) < 0) {
-#endif
-	    fprintf(stderr, 
-		    "** Could not disconnect from shared memory segment! **\n");
-	  }
-      } else {
-	debugmem->mushport = mudconf.port;
-	fprintf(stderr, 
-		"Slave IPC Debugging stack connected w/ key = %d\n",
-		mudconf.debug_id);
-      }
-    }
-    /* It might get set to NULL by the above if statement */
-    if (debugmem == NULL) {
-      fprintf(stderr, "** IPC Debugging disabled **\n");
-      debugmem = (Debugmem *)malloc(sizeof(Debugmem));
-      
-      if( !debugmem ) {
-        fprintf(stderr, "Unable to allocate fake debug memory.\n");
-        abort();
-      }
-      INITDEBUG(debugmem);
-    } 
-#else
-    fprintf(stderr, "** IPC Debugging disabled per request **\n");
-    debugmem = (Debugmem *)malloc(sizeof(Debugmem));
-    if( !debugmem ) {
-      fprintf(stderr, "Unable to allocate fake debug memory.\n");
-      abort();
-    }
-    INITDEBUG(debugmem);
+	handle_init_db_load(mindb, rebooting);
 
-#endif /* !NODEBUGMONITOR */
-
-    DPUSH; /* #92 */
-
-    sprintf(gdbmDbPath, "%s/%s", mudconf.data_dir, mudconf.gdbm);
-    if (mindb)
-	unlink(gdbmDbPath);
-    if (init_gdbm_db(gdbmDbPath) < 0) {
-	STARTLOG(LOG_ALWAYS, "INI", "LOAD")
-	    log_text((char *) "Couldn't load text database: ");
-	log_text(mudconf.gdbm);
-	ENDLOG
-        DPOP; /* #92 */
-	exit(2);
-    }
-    mudstate.dbloading = 1; /* fast-load attributes without additional checks */
-    if (mindb)
-	db_make_minimal();
-    else if (load_game(rebooting) < 0) {
-	STARTLOG(LOG_ALWAYS, "INI", "LOAD")
-	    log_text((char *) "Couldn't load: ");
-	log_text(mudconf.indb);
-	ENDLOG
-	DPOP; /* #92 */
-	exit(2);
-    }
-    mudstate.dbloading = 0;
     srandom(getpid());
     set_signals();
 
-    /* initialize the buffers and variables */
-    for (mindb = 0; mindb < (MAX_GLOBAL_REGS + MAX_GLOBAL_BOOST); mindb++) {
-	mudstate.global_regs[mindb] = alloc_lbuf("main.global_reg");
-	mudstate.global_regsname[mindb] = alloc_sbuf("main.global_regname");
-#ifndef NO_GLOBAL_REGBACKUP
-	mudstate.global_regs_backup[mindb] = alloc_lbuf("main.global_regbkup");
-#endif
-    }
+	handle_init_buffers_vars();
 
     /* Do a consistency check and set up the freelist */
     do_dbck(NOTHING, NOTHING, 0);
 
     /* Reset all the hash stats */
+	reset_global_hashtabs();
 
-    hashreset(&mudstate.command_htab);
-    hashreset(&mudstate.command_vattr_htab);
-    hashreset(&mudstate.logout_cmd_htab);
-    hashreset(&mudstate.func_htab);
-    hashreset(&mudstate.toggles_htab);
-    hashreset(&mudstate.powers_htab);
-    hashreset(&mudstate.depowers_htab);
-    hashreset(&mudstate.flags_htab);
-    hashreset(&mudstate.attr_name_htab);
-    nhashreset(&mudstate.attr_num_htab);
-    hashreset(&mudstate.player_htab);
-    hashreset(&mudstate.objecttag_htab);
-    nhashreset(&mudstate.fwdlist_htab);
-    hashreset(&mudstate.news_htab);
-    hashreset(&mudstate.help_htab);
-#ifdef PLUSHELP
-    hashreset(&mudstate.plushelp_htab);
-#endif
-    hashreset(&mudstate.wizhelp_htab);
-    hashreset(&mudstate.error_htab);
-    nhashreset(&mudstate.desc_htab);
-
-/*  Missing hash resets */
-    hashreset(&mudstate.cmd_alias_htab);
-    hashreset(&mudstate.ufunc_htab);
-    hashreset(&mudstate.ulfunc_htab);
-    nhashreset(&mudstate.parent_htab);
-    hashreset(&mudstate.ansi_htab);
-    hashreset(&mudstate.totem_htab);
-
-    mudstate.nowmsec = time_ng(NULL);
-    mudstate.now = (time_t) floor(mudstate.nowmsec);
-    mudstate.lastnowmsec = mudstate.nowmsec;
-    mudstate.lastnow = mudstate.now;
-    mudstate.evalnum = 0;
-    mudstate.guest_num = 0;
-    mudstate.guest_status = 0;
-    mudstate.free_num = NOTHING;
-    mudstate.nuke_status = 0;
-    mudstate.exitcheck = 0;
-    mudstate.droveride = 0;
-    mudstate.scheck = 0;
-    mudstate.mail_state = mail_init();
-    mudstate.autoreg = areg_init();
-    start_news_system();
-    val_count();
+	handle_init_mudstate();
 
     /* Load in the command hashes for vattrs before startup foo */
     cf_read((char *)"rhost_vattr.conf");
     unlink("rhost_vattr.conf");
 
     process_preload();
+
     if (mudconf.rwho_transmit)
-	do_rwho(NOTHING, NOTHING, RWHO_START);
+		do_rwho(NOTHING, NOTHING, RWHO_START);
 
     /* Reset #1's password if value is right */
+
     if ( mudconf.newpass_god == 777 ) {
-       if ( Good_chk(GOD) ) {
-          s_Pass(GOD, mush_crypt((const char *)"Nyctasia", 1));
-          STARTLOG(LOG_ALWAYS, "WIZ", "PASS")
-             log_text((char *) "GOD password reset to 'Nyctasia'");
-          ENDLOG
-       }
-       mudconf.newpass_god = 0;
+    	handle_newpass_god();
+        mudconf.newpass_god = 0;
     }
     /* go do it */
 
-
-    mudstate.nowmsec = time_ng(NULL);
-    mudstate.now = (time_t) floor(mudstate.nowmsec);
-    mudstate.lastnowmsec = mudstate.nowmsec;
-    mudstate.lastnow = mudstate.now;
+    mudstate_timestamp();
     init_timer();
 
     if( rebooting ) {
       if( !load_reboot_db() ) {
-	DPOP; /* #92 */
+		DPOP; /* #92 */
         exit(1);
       }
     }
@@ -3020,9 +3115,7 @@ main(int argc, char *argv[])
       close_sockets(0, (char *) "Going down - Bye");
     else {
       close_main_socket();
-      DESC_ITER_CONN(d) {
-	freeqs(d,0);
-      }
+    	handle_free_descs();
     }
 
     dump_database();
@@ -3063,6 +3156,7 @@ main(int argc, char *argv[])
   return(0);
 #endif
 }
+#endif
 
 static void 
 NDECL(init_rlimit)
